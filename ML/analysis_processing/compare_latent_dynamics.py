@@ -250,7 +250,7 @@ def parse_args() -> argparse.Namespace:
         "--data-b-name",
         type=str,
         default=None,
-        help="Comparison dataset filename under first_tests/quantum_code/data (e.g. large_otoc.pkl)",
+        help="Comparison dataset filename under quantum_code/data (e.g. large_otoc.pkl)",
     )
     p.add_argument("--ckpt", type=Path, default=None, help="VAE checkpoint path")
     p.add_argument("--out-dir", type=Path, default=None, help="Output run dir (default: checkpoint run root)")

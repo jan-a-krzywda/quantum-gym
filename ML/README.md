@@ -4,7 +4,7 @@ This folder contains training, analysis, simulation, and plotting scripts for th
 
 ## Recommended layout per run
 
-Each run directory under `first_tests/ML/runs/<run_name>/` should use:
+Each run directory under `ML/runs/<run_name>/` should use:
 
 - `checkpoints/` - model weights (`vae_checkpoint.pt`)
 - `figures/` - PNG/GIF outputs
@@ -17,7 +17,7 @@ The scripts now default to this layout (with fallback to legacy paths).
 
 ```bash
 cd /Users/krzywdaja/Documents/quantum-gym
-PYTHONPATH=first_tests python first_tests/ML/train_vae.py
+PYTHONPATH=. python ML/train_vae.py
 ```
 
 Outputs (default run `fid_job_memory_noreset_large`):
@@ -28,7 +28,7 @@ Outputs (default run `fid_job_memory_noreset_large`):
 ## 2) Analyze latent dynamics (means, drift covariance, correlation time)
 
 ```bash
-PYTHONPATH=first_tests python first_tests/ML/analyze_latent_dynamics.py
+PYTHONPATH=. python ML/analyze_latent_dynamics.py
 ```
 
 Outputs:
@@ -50,7 +50,7 @@ Useful flags:
 ## 3) Generate synthetic zebra from iid latent sampling
 
 ```bash
-PYTHONPATH=first_tests python first_tests/ML/generate_vae_gif.py --latent-mode iid
+PYTHONPATH=. python ML/generate_vae_gif.py --latent-mode iid
 ```
 
 Outputs:
@@ -61,7 +61,7 @@ Outputs:
 ## 4) Simulate from fitted latent dynamics then decode zebra
 
 ```bash
-PYTHONPATH=first_tests python first_tests/ML/simulate_fitted_latent_zebra.py --sim-mode ou
+PYTHONPATH=. python ML/simulate_fitted_latent_zebra.py --sim-mode ou
 ```
 
 Outputs:
@@ -74,8 +74,8 @@ Outputs:
 ## 5) Latent trajectory GIFs
 
 ```bash
-PYTHONPATH=first_tests python first_tests/ML/make_latent_gif.py --run-dir first_tests/ML/runs/fid_job_memory_noreset_large
-PYTHONPATH=first_tests python first_tests/ML/plot_latent_dynamics_gif.py --source encoded
+PYTHONPATH=. python ML/make_latent_gif.py --run-dir ML/runs/fid_job_memory_noreset_large
+PYTHONPATH=. python ML/plot_latent_dynamics_gif.py --source encoded
 ```
 
 Outputs go to `figures/`.

@@ -29,9 +29,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-_FIRST_TESTS = Path(__file__).resolve().parents[2]
-if str(_FIRST_TESTS) not in sys.path:
-    sys.path.insert(0, str(_FIRST_TESTS))
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 if "TORCH_CPP_LOG_LEVEL" not in os.environ:
     os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
@@ -117,8 +117,8 @@ def _run_root_from_ckpt(ckpt_path: Path) -> Path:
 def _ensure_tuna_module_on_path() -> None:
     """Add the directory containing ``tuna_fid_single_job.py`` to ``sys.path``."""
     candidates = (
-        _FIRST_TESTS / "inspire",
-        _FIRST_TESTS / "quantum_code",
+        _REPO_ROOT / "inspire",
+        _REPO_ROOT / "quantum_code",
     )
     for d in candidates:
         if (d / "tuna_fid_single_job.py").is_file():
@@ -127,7 +127,7 @@ def _ensure_tuna_module_on_path() -> None:
                 sys.path.insert(0, s)
             return
     raise ModuleNotFoundError(
-        "Could not locate tuna_fid_single_job.py in first_tests/inspire or first_tests/quantum_code"
+        "Could not locate tuna_fid_single_job.py in inspire or quantum_code under repo root."
     )
 
 
@@ -139,9 +139,9 @@ def _resolve_source_pickle_path(path_from_ckpt: Path, run_root: Path) -> Path | 
     name = path_from_ckpt.name if path_from_ckpt.name else "fid_job_memory_noreset_large.pkl"
     candidates.extend(
         [
-            _FIRST_TESTS / "inspire" / name,
-            _FIRST_TESTS / "quantum_code" / name,
-            _FIRST_TESTS / "quantum_code" / "data" / name,
+            _REPO_ROOT / "inspire" / name,
+            _REPO_ROOT / "quantum_code" / name,
+            _REPO_ROOT / "quantum_code" / "data" / name,
             run_root / "data" / name,
         ]
     )

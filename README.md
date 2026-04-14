@@ -1,6 +1,6 @@
 # Quantum Gym
 
-Quantum + ML workflow for generating and analyzing zebra-style FID behavior.
+Quantum + ML workflow for creating an efficient low-dimensional representation of a noisy quantum system. This digital twin approach can be used for control, monitoring, and diagnostics of the system. 
 
 ## What this repo does
 
@@ -13,14 +13,14 @@ Quantum + ML workflow for generating and analyzing zebra-style FID behavior.
 
 Add generated GIFs to `docs/gifs/` with the names below so they render in this README:
 
-### Synthetic zebra evolution
-![Synthetic zebra evolution](docs/gifs/synthetic-zebra.gif)
+### Running average of qubit response
+![Synthetic zebra evolution](docs/gifs/real_data.gif)
 
-### Latent dynamics animation
-![Latent dynamics animation](docs/gifs/latent-dynamics.gif)
+### Latent dynamics animation (comparison across two days)
+![Latent dynamics animation](docs/gifs/two_days.gif)
 
-### Simulated fitted latent zebra
-![Simulated fitted latent zebra](docs/gifs/sim-fitted-zebra.gif)
+### Generated artificial data
+![Simulated fitted latent zebra](docs/gifs/sim_data.gif)
 
 ## How to run
 

@@ -14,10 +14,10 @@ import numpy as np
 def _ensure_inspire_on_path() -> Path:
     """Ensure the directory containing ``tuna_fid_single_job`` is importable."""
     ml_dir = Path(__file__).resolve().parent
-    first_tests = ml_dir.parent.parent
+    repo_root = ml_dir.parent.parent
     candidates = (
-        first_tests / "quantum_code",  # current layout
-        first_tests / "inspire",       # legacy layout
+        repo_root / "quantum_code",  # current layout
+        repo_root / "inspire",  # legacy layout
     )
     for module_dir in candidates:
         if (module_dir / "tuna_fid_single_job.py").is_file():
@@ -26,7 +26,7 @@ def _ensure_inspire_on_path() -> Path:
                 sys.path.insert(0, s)
             return module_dir
     raise FileNotFoundError(
-        "Could not locate tuna_fid_single_job.py in first_tests/quantum_code or first_tests/inspire."
+        "Could not locate tuna_fid_single_job.py in quantum_code or inspire under repo root."
     )
 
 

@@ -1,0 +1,17 @@
+# Local system files
+.DS_Store
+
+# Generated artifacts
+*.pkl
+*.png
+*.gif
+*.gifs
+*.npz
+*.json
+*.pyc
+*.pt
+
+# Keep documentation GIF previews trackable for README
+!docs/
+!docs/gifs/
+!docs/gifs/*.gif

@@ -1,0 +1,64 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{Reinforcement Learning in Quantum-Inspired Latent Space}
+\author{RL-world-model Overview}
+\date{}
+\maketitle
+
+\section*{Introduction}
+The \texttt{RL-world-model} implements a reinforcement learning pipeline in a quantum-inspired environment. The workflow consists of dataset generation, latent space modeling, and agent training. Below, we describe the key components:
+
+\section*{Dataset Generation}
+The script \texttt{generate\_dataset.py} performs Breadth-First Search (BFS) over a quantum state space:
+\begin{itemize}
+    \item States are deduplicated using global-phase invariance.
+    \item Each unique state is fingerprinted as a binary vector.
+    \item A transition table is generated, mapping actions to next states.
+\end{itemize}
+The dataset is saved in \texttt{.npz} format with the following fields:
+\[
+\text{fingerprints}, \text{transitions}, \text{depths}, \text{action\_names}.
+\]
+
+\section*{Latent Space Modeling}
+\subsection*{MLP-VAE}
+The \texttt{mlp\_vae.py} defines a Variational Autoencoder (VAE) with the following structure:
+\begin{align*}
+\text{Encoder:} & \quad \text{Input} \to \text{Hidden Layers} \to (\mu, \log \sigma^2) \\
+\text{Decoder:} & \quad \text{Latent Vector} \to \text{Hidden Layers} \to \text{Output}.
+\end{align*}
+The VAE maps high-dimensional fingerprints to a low-dimensional latent space.
+
+\subsection*{Latent Dynamics Model}
+The \texttt{train\_world\_model.py} trains a model $f_v$ to predict the next latent state:
+\[
+f_v(\mu, a) \to \mu',
+\]
+where $\mu$ is the current latent state, $a$ is a one-hot encoded action, and $\mu'$ is the predicted next state.
+
+\section*{Reinforcement Learning}
+The \texttt{train\_rl\_agent.py} trains a Deep Q-Network (DQN) agent in the latent space:
+\begin{itemize}
+    \item \textbf{State:} $\mu \in \mathbb{R}^{\text{latent\_dim}}$.
+    \item \textbf{Action:} Discrete actions from the transition table.
+    \item \textbf{Reward:} $R = -\|\mu' - \mu_{\text{target}}\|_2$.
+\end{itemize}
+The agent learns to navigate the latent space to reach a target state.
+
+\section*{Quantum Fingerprints}
+The \texttt{multiqubit\_fingerprint.py} generates binary fingerprints for quantum states:
+\begin{itemize}
+    \item Sweeps rotation angles $\theta$ for each qubit.
+    \item Samples $n_{\text{shots}}$ measurements in the $Z$-basis.
+    \item Outputs a binary matrix of shape $(n_{\text{shots}}, n_{\text{qubits}} \times n_{\theta})$.
+\end{itemize}
+
+\section*{Conclusion}
+The \texttt{RL-world-model} provides a modular framework for reinforcement learning in a quantum-inspired latent space. It combines quantum state simulation, latent space modeling, and RL agent training.
+
+\end{document}

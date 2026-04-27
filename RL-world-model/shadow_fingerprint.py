@@ -4,11 +4,12 @@ Shadow-tomography fingerprint for multiqubit quantum states.
 Uses random Pauli-basis measurements to estimate 1-local and 2-local Pauli
 expectation values. Output: 36-dim float32 vector per state (n_qubits=3).
 
-Feature layout:
+Feature layout (63-dim, reconstructs full 3-qubit density matrix):
   [0:9]   1-local:  ⟨X₀⟩,⟨Y₀⟩,⟨Z₀⟩, ⟨X₁⟩,⟨Y₁⟩,⟨Z₁⟩, ⟨X₂⟩,⟨Y₂⟩,⟨Z₂⟩
   [9:18]  2-local (pair 0,1): ⟨XX⟩,⟨XY⟩,⟨XZ⟩,⟨YX⟩,⟨YY⟩,⟨YZ⟩,⟨ZX⟩,⟨ZY⟩,⟨ZZ⟩
   [18:27] 2-local (pair 0,2): same order
   [27:36] 2-local (pair 1,2): same order
+  [36:63] 3-local (triple 0,1,2): ⟨XXX⟩,⟨XXY⟩,...,⟨ZZZ⟩  (27 terms)
 
 Inversion factors (Huang et al. 2020, random Pauli measurements):
   1-local: feature = (3/T) * Σ_{t: basis matches} b_q
@@ -51,10 +52,12 @@ _BASIS_IDX = {"X": 0, "Y": 1, "Z": 2}
 
 N_FEATURES_1Q = 9    # 3 qubits × 3 Paulis
 N_FEATURES_2Q = 27   # 3 pairs × 9 Pauli combos
-N_FEATURES = N_FEATURES_1Q + N_FEATURES_2Q  # 36
+N_FEATURES_3Q = 27   # 1 triple × 27 Pauli combos  (3-qubit only)
+N_FEATURES = N_FEATURES_1Q + N_FEATURES_2Q + N_FEATURES_3Q  # 63
 
-# Canonical qubit pairs (for n_qubits=3)
+# Canonical qubit pairs and triples (for n_qubits=3)
 _PAIRS_3Q = [(0, 1), (0, 2), (1, 2)]
+_TRIPLES_3Q = [(0, 1, 2)]
 
 
 def _apply_basis_rotation(qc: QuantumCircuit, basis_str: str) -> None:
@@ -129,6 +132,25 @@ def shadow_fingerprint_from_statevector(
                 joint = basis_oh[:, q1, p1] * basis_oh[:, q2, p2]  # (T,) 0/1
                 fingerprint[idx] = 9.0 * float((prod * joint).sum()) / n_shots
                 idx += 1
+
+    # 3-local (3-qubit only): (27/T) * Σ_{t: all 3 bases match} b0*b1*b2  →  ⟨P0 P1 P2⟩
+    if n_qubits == 3:
+        triples = _TRIPLES_3Q
+    else:
+        triples = [
+            (q0, q1, q2)
+            for q0 in range(n_qubits)
+            for q1 in range(q0 + 1, n_qubits)
+            for q2 in range(q1 + 1, n_qubits)
+        ]
+    for q0, q1, q2 in triples:
+        triple_prod = outcomes[:, q0] * outcomes[:, q1] * outcomes[:, q2]  # (T,)
+        for p0 in range(3):
+            for p1 in range(3):
+                for p2 in range(3):
+                    joint = basis_oh[:, q0, p0] * basis_oh[:, q1, p1] * basis_oh[:, q2, p2]
+                    fingerprint[idx] = 27.0 * float((triple_prod * joint).sum()) / n_shots
+                    idx += 1
 
     return fingerprint
 

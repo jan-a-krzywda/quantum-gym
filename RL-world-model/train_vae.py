@@ -1,17 +1,17 @@
 """
-Phase 3: Train MLP-VAE on BFS fingerprint dataset.
+Phase 3: Train MLP-VAE on shadow fingerprint dataset.
 
-Each fingerprint row (one shot of one state) is a 120-dim binary vector.
-MlpVAE (seq_len → latent_dim=2) is ~100x faster than Conv1D on CPU because
-fingerprints are feature vectors, not temporal sequences needing conv filters.
+Input: 63-dim float32 shadow Pauli expectations (1-local + 2-local + 3-local).
+MlpVAE (seq_len=63 → latent_dim) compresses noisy physical fingerprints to a
+smooth latent manifold, acting as a denoiser against SPAM errors.
 
 After training:
-  - Encodes all N states → μ_states (N, latent_dim)
-  - Encodes GHZ target  → μ_target (latent_dim,)
-  - Saves checkpoint + latent arrays to RL-world-model/runs/<name>/
+  - Encodes all states → μ_states (N, latent_dim)
+  - Encodes GHZ target → μ_target (latent_dim,)
+  - Saves checkpoint + latent arrays to RL-world-model/runs/vae/
 
 Usage:
-    python RL-world-model/train_vae.py --data RL-world-model/data/bfs_dataset.npz
+    python RL-world-model/train_vae.py --data RL-world-model/data/transition_dataset.npz
 """
 
 from __future__ import annotations
@@ -100,9 +100,9 @@ def encode_states(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Conv-VAE on BFS fingerprint dataset")
+    p = argparse.ArgumentParser(description="Phase 3: Train MLP-VAE on shadow fingerprint dataset")
     p.add_argument("--data", type=Path, required=True,
-                   help="BFS dataset .npz from generate_dataset.py")
+                   help="transition_dataset.npz from generate_dataset.py")
     p.add_argument("--latent-dim", type=int, default=2)
     p.add_argument("--hidden", type=int, default=256,
                    help="MlpVAE hidden dim (default 256)")
@@ -114,8 +114,8 @@ def parse_args() -> argparse.Namespace:
                         "Keep small for CPU speed; VAE still sees 15k×4=60k diverse pairs.")
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--beta", type=float, default=1.0)
-    p.add_argument("--beta-start", type=float, default=0.05)
-    p.add_argument("--beta-warmup", type=int, default=20)
+    p.add_argument("--beta-start", type=float, default=0.02)
+    p.add_argument("--beta-warmup", type=int, default=30)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=Path, default=None,
@@ -132,22 +132,23 @@ def main() -> None:
 
     # --- Load dataset ---
     raw = np.load(args.data, allow_pickle=True)
-    fingerprints = raw["fingerprints"]          # (N, n_samples, n_features) float32
-    transitions = raw["transitions"]            # (N, A) int32
-    n_qubits = int(raw["n_qubits"])
-    action_names = list(raw["action_names"])
-    N, n_samples_data, n_features = fingerprints.shape
+    fingerprints = raw["fingerprints"]          # (M, n_features) float32 — 2D transition dataset
 
-    print(f"Dataset: {N} states × {n_samples_data} samples × {n_features} features", flush=True)
-    print(f"         n_qubits={n_qubits}, actions={len(action_names)}", flush=True)
+    # Handle legacy 3D format (N, n_samples, n_features) from old BFS pipeline
+    if fingerprints.ndim == 3:
+        N, n_samples_data, n_features = fingerprints.shape
+        train_shots = min(args.train_shots, n_samples_data)
+        x_train = fingerprints[:, :train_shots, :].reshape(N * train_shots, n_features).astype(np.float32)
+        print(f"Dataset (3D): {N} states × {n_samples_data} samples × {n_features} features", flush=True)
+    else:
+        n_features = fingerprints.shape[1]
+        x_train = fingerprints.astype(np.float32)   # (M, 63)
+        print(f"Dataset (2D): {len(x_train)} transitions × {n_features} features", flush=True)
 
-    # Subsample shadow samples for training speed; all samples used for post-train encoding
-    train_shots = min(args.train_shots, n_samples_data)
-    seq_len = n_features  # alias kept for downstream compatibility
-    x_train = fingerprints[:, :train_shots, :].reshape(N * train_shots, seq_len).astype(np.float32)
+    n_qubits = int(raw["n_qubits"]) if "n_qubits" in raw else 3
     n_train = len(x_train)
-    print(f"Training samples: {N} states × {train_shots} shadow samples = {n_train:,}  "
-          f"(encoding uses all {n_samples_data} samples)", flush=True)
+    seq_len = n_features
+    print(f"Training samples: {n_train:,}  seq_len={seq_len}", flush=True)
 
     tensor_x = torch.from_numpy(x_train)  # (N*train_shots, seq_len) — MLP: no unsqueeze
     loader = DataLoader(
@@ -160,6 +161,10 @@ def main() -> None:
     device = _pick_device(args.device)
     model = MlpVAE(seq_len=seq_len, latent_dim=args.latent_dim, hidden=args.hidden).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Cosine annealing scheduler to speed up fine-tuning
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)
+    
     n_batches = max(1, len(loader))
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: MlpVAE seq_len={seq_len}, latent_dim={args.latent_dim}, "
@@ -188,16 +193,26 @@ def main() -> None:
         epoch_secs = t_now - t_epoch_start
         t_epoch_start = t_now
         if epoch % args.log_every == 0 or epoch == args.epochs - 1:
+            current_lr = scheduler.get_last_lr()[0]
             print(
                 f"Epoch {epoch:4d} | β={beta_e:.3f} | loss={sum_loss/n_batches:.4f} "
+                f"Epoch {epoch:4d} | β={beta_e:.3f} | lr={current_lr:.1e} | loss={sum_loss/n_batches:.4f} "
                 f"(bce={sum_rec/n_batches:.4f} + β·kl={beta_e*sum_kl/n_batches:.4f}) "
                 f"| {epoch_secs:.1f}s",
                 flush=True,
             )
+            
+        scheduler.step()
 
-    # --- Encode all states → μ_states (use full n_shots for accuracy) ---
-    print("Encoding all states...", flush=True)
-    mu_states = encode_states(model, fingerprints, device)  # (N, latent_dim)
+    # --- Encode training fingerprints → μ_states ---
+    print("Encoding fingerprints to latents...", flush=True)
+    model.eval()
+    with torch.no_grad():
+        x_all = torch.from_numpy(x_train).to(device)
+        mu_states_list = []
+        for start in range(0, len(x_all), 2048):
+            mu_states_list.append(model.encode_mu(x_all[start:start+2048]).cpu().numpy())
+    mu_states = np.concatenate(mu_states_list, axis=0)   # (M, latent_dim)
     print(f"μ_states range: [{mu_states.min():.3f}, {mu_states.max():.3f}]", flush=True)
 
     # --- Encode GHZ + |000> targets via shadow fingerprints ---
@@ -211,9 +226,8 @@ def main() -> None:
     ghz_fp = _sf_mod.shadow_fingerprint_batch(
         _sf_mod.prepare_ghz_state(n_qubits),
         n_qubits, n_shots_per_sample=256, n_samples=256, rng=rng,
-    )  # (256, n_features)
+    )   # (256, 63)
     ghz_tensor = torch.from_numpy(ghz_fp).to(device)
-    model.eval()
     with torch.no_grad():
         mu_ghz = model.encode_mu(ghz_tensor).mean(dim=0).cpu().numpy()
     print(f"GHZ target μ: {mu_ghz}", flush=True)
@@ -221,20 +235,20 @@ def main() -> None:
     zero_fp = _sf_mod.shadow_fingerprint_batch(
         _sf_mod.prepare_zero_state(n_qubits),
         n_qubits, n_shots_per_sample=256, n_samples=256, rng=rng,
-    )  # (256, n_features)
+    )   # (256, 63)
     zero_tensor = torch.from_numpy(zero_fp).to(device)
     with torch.no_grad():
         mu_zero = model.encode_mu(zero_tensor).mean(dim=0).cpu().numpy()
     print(f"|000> start μ: {mu_zero}", flush=True)
 
-    # --- Save ---
+    # --- Save checkpoint ---
     out_dir = args.out_dir if args.out_dir is not None else _HERE / "runs" / "vae"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt = {
         "arch": "MlpVAE",
         "model": model.state_dict(),
-        "seq_len": seq_len,        # = n_features = 36
+        "seq_len": seq_len,          # = n_features = 63
         "latent_dim": args.latent_dim,
         "hidden": args.hidden,
         "n_qubits": n_qubits,
@@ -248,38 +262,58 @@ def main() -> None:
 
     np.savez_compressed(
         out_dir / "latents.npz",
-        mu_states=mu_states,          # (N, latent_dim) — one per BFS state
-        mu_ghz=mu_ghz,                # (latent_dim,)   — GHZ target
-        mu_zero=mu_zero,              # (latent_dim,)   — |000> start
-        transitions=transitions,      # (N, A) int32    — carried from dataset
-        action_names=np.array(action_names),
+        mu_states=mu_states,    # (M, latent_dim)
+        mu_ghz=mu_ghz,          # (latent_dim,)
+        mu_zero=mu_zero,        # (latent_dim,)
     )
 
-    # --- Load entanglement measures ---
-    entanglement_measures = raw["entanglement_measures"]
-
-    # --- Plot latent scatter ---
+    # --- Plot latent scatter coloured by fidelity (if available) ---
     import matplotlib.pyplot as plt
 
-    def get_first_two_dimensions(mu_states, mu_ghz, mu_zero):
-        if mu_states.shape[1] > 2:
-            return mu_states[:, :2], mu_ghz[:2], mu_zero[:2]
-        return mu_states, mu_ghz, mu_zero
+    if "fidelities" in raw.files:
+        color_vals = raw["fidelities"]
+        color_label = "GHZ fidelity"
+    elif "distances" in raw.files:
+        color_vals = raw["distances"]
+        color_label = "GHZ distance"
+    else:
+        color_vals = np.arange(len(mu_states))
+        color_label = "sample index"
 
-    mu_states_2d, mu_ghz_2d, mu_zero_2d = get_first_two_dimensions(mu_states, mu_ghz, mu_zero)
+    if mu_states.shape[1] > 2:
+        pca = PCA(n_components=2)
+        mu_2d = pca.fit_transform(mu_states)
+        mu_ghz_2d  = pca.transform([mu_ghz])[0]
+        mu_zero_2d = pca.transform([mu_zero])[0]
+        xlabel, ylabel = "PCA 1", "PCA 2"
+    elif mu_states.shape[1] == 1:
+        mu_2d = np.column_stack((mu_states[:, 0], color_vals))
+        
+        if "distance" in color_label.lower():
+            y_ghz, y_zero = 0.0, 0.7071  # sqrt(1 - 0.5) ≈ 0.7071
+        elif "fidelity" in color_label.lower():
+            y_ghz, y_zero = 1.0, 0.5
+        else:
+            y_ghz, y_zero = 0, len(mu_states) // 2
+            
+        mu_ghz_2d  = [mu_ghz[0], y_ghz]
+        mu_zero_2d = [mu_zero[0], y_zero]
+        xlabel, ylabel = "μ₁", color_label
+    else:
+        mu_2d = mu_states
+        mu_ghz_2d  = mu_ghz
+        mu_zero_2d = mu_zero
+        xlabel, ylabel = "μ₁", "μ₂"
 
-    depths = raw["depths"]
     fig, ax = plt.subplots(figsize=(7, 6))
-    sc = ax.scatter(
-        mu_states_2d[:, 0], mu_states_2d[:, 1],
-        c=depths, cmap="viridis", alpha=0.4, s=8, label="BFS states"
-    )
-    plt.colorbar(sc, ax=ax, label="BFS depth")
-    ax.scatter(*mu_ghz_2d, color="red", s=120, marker="*", zorder=5, label="GHZ target")
-    ax.scatter(*mu_zero_2d, color="cyan", s=120, marker="^", zorder=5, label="|000>")
-    ax.set_xlabel("μ₁")
-    ax.set_ylabel("μ₂")
-    ax.set_title(f"VAE latent space — {N} BFS states  (latent_dim={args.latent_dim})")
+    sc = ax.scatter(mu_2d[:, 0], mu_2d[:, 1],
+                    c=color_vals, cmap="RdBu_r", alpha=0.4, s=8)
+    plt.colorbar(sc, ax=ax, label=color_label)
+    ax.scatter(*mu_ghz_2d,  color="red",  s=120, marker="*", zorder=5, label="GHZ")
+    ax.scatter(*mu_zero_2d, color="black", s=120, marker="^", zorder=5, label="|000>")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"VAE latent space — {len(mu_states)} samples  (latent_dim={args.latent_dim})")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -287,63 +321,131 @@ def main() -> None:
     fig.savefig(fig_path, dpi=150)
     plt.close()
 
-    # --- Plot latent scatter with entanglement ---
-    fig, ax = plt.subplots(figsize=(7, 6))
-    sc = ax.scatter(
-        mu_states_2d[:, 0], mu_states_2d[:, 1],
-        c=entanglement_measures, cmap="plasma", alpha=0.4, s=8, label="BFS states"
-    )
-    plt.colorbar(sc, ax=ax, label="Entanglement Measure")
-    ax.scatter(*mu_ghz_2d, color="red", s=120, marker="*", zorder=5, label="GHZ target")
-    ax.scatter(*mu_zero_2d, color="cyan", s=120, marker="^", zorder=5, label="|000>")
-    ax.set_xlabel("μ₁")
-    ax.set_ylabel("μ₂")
-    ax.set_title(f"VAE latent space — {N} BFS states  (latent_dim={args.latent_dim})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig_path_entanglement = out_dir / "latent_scatter_entanglement.png"
-    fig.savefig(fig_path_entanglement, dpi=150)
-    plt.close()
+    # --- Plot top-3 beam search trajectories in latent space ---
+    traj_path = _HERE / "data" / "beam_trajectories.npz"
+    if traj_path.exists():
+        print("Plotting top-3 beam search trajectories in latent space...", flush=True)
 
-    # --- Plot latent scatter with PCA ---
-    if mu_states.shape[1] > 2:
-        pca = PCA(n_components=2)
-        mu_states_2d = pca.fit_transform(mu_states)
+        # Dynamically load load_trajectories from beam_search.py
+        import importlib.util as _ilu
+        _bs_spec = _ilu.spec_from_file_location("beam_search", _HERE / "beam_search.py")
+        _bs_mod = _ilu.module_from_spec(_bs_spec)
+        _bs_spec.loader.exec_module(_bs_mod)
+
+        trajectories = _bs_mod.load_trajectories(traj_path)
+        # Already sorted by fidelity descending
+        top3 = trajectories[:3]
+
+        def encode_trajectory(traj: dict) -> np.ndarray:
+            """Encode each step of a trajectory's angle_schedule → latent μ.
+
+            Optimizations (keep sampling):
+            - evolve a single Statevector incrementally by applying only the new layer
+            - sample fingerprints per-step but stack all samples and call the VAE encoder once
+            - average encoder outputs per step to obtain μ for that step
+            """
+            sched = traj["angle_schedule"]  # (n_rounds, 6)
+            n_rounds = len(sched)
+            if n_rounds == 0:
+                return np.zeros((0, model.latent_dim), dtype=np.float32)
+
+            # sampling parameters (kept stochastic to match real-device fingerprints)
+            n_shots_per_sample = 256
+            n_samples_per_step = 256
+
+            # prepare list to accumulate fingerprint arrays per step
+            fp_list = []  # each element: (n_samples_per_step, seq_len)
+
+            # build initial statevector for first step, then evolve incrementally
+            sv = _bs_mod.ghz_target_sv().__class__(_bs_mod.build_ansatz_circuit(sched[:1]))
+
+            # NOTE: using the RNG passed from main for reproducibility
+            for step in range(1, n_rounds + 1):
+                if step > 1:
+                    # apply only the new layer (sched[step-1]) to evolve sv
+                    layer_angles = sched[step - 1]
+                    QC = _bs_mod.QuantumCircuit
+                    layer = QC(_bs_mod.N_QUBITS)
+                    # forward layer: Ry(theta) Rz(phi) per qubit, then CZs
+                    for q in range(_bs_mod.N_QUBITS):
+                        theta = float(layer_angles[2 * q])
+                        phi = float(layer_angles[2 * q + 1])
+                        layer.ry(theta, q)
+                        layer.rz(phi, q)
+                    for q0, q1 in _bs_mod.CONNECTIVITY:
+                        layer.cz(q0, q1)
+                    sv = sv.evolve(layer)
+
+                # sample fingerprints for this step (keeps stochastic, matches real-device style)
+                fp = _sf_mod.shadow_fingerprint_batch(
+                    sv, n_qubits,
+                    n_shots_per_sample=n_shots_per_sample,
+                    n_samples=n_samples_per_step,
+                    rng=rng,
+                )
+                fp_list.append(fp.astype(np.float32))
+
+            # Batch-encode all fingerprints at once to amortize PyTorch overhead
+            # fp_stack: (n_rounds * n_samples_per_step, seq_len)
+            fp_stack = np.vstack(fp_list)
+            t = torch.from_numpy(fp_stack).to(device)
+            with torch.no_grad():
+                mu_all = model.encode_mu(t)  # (total_samples, latent_dim)
+            mu_all = mu_all.cpu().numpy()
+
+            # reshape back to (n_rounds, n_samples_per_step, latent_dim) and average
+            latent_dim = mu_all.shape[1]
+            mu_all = mu_all.reshape(n_rounds, n_samples_per_step, latent_dim)
+            mus = mu_all.mean(axis=1)  # (n_rounds, latent_dim)
+            return mus
+
+        traj_colors = ["orange", "lime", "magenta"]
+        traj_latents = []
+        for i, traj in enumerate(top3):
+            print(f"  Encoding trajectory {i+1}/3  fidelity={traj['fidelity']:.4f}", flush=True)
+            mus = encode_trajectory(traj)
+            traj_latents.append(mus)
+
+        fig2, ax2 = plt.subplots(figsize=(7, 6))
+        sc2 = ax2.scatter(mu_2d[:, 0], mu_2d[:, 1],
+                          c=color_vals, cmap="RdBu_r", alpha=0.3, s=6)
+        plt.colorbar(sc2, ax=ax2, label=color_label)
+        ax2.scatter(*mu_ghz_2d,  color="red",  s=120, marker="*", zorder=5, label="GHZ")
+        ax2.scatter(*mu_zero_2d, color="black", s=120, marker="^", zorder=5, label="|000>")
+
+        for i, (mus, traj) in enumerate(zip(traj_latents, top3)):
+            # Project trajectory to 2D if needed
+            if mu_states.shape[1] > 2:
+                mus_2d = pca.transform(mus)
+            elif mu_states.shape[1] == 1:
+                mus_2d = np.column_stack((mus[:, 0], np.zeros(len(mus))))
+            else:
+                mus_2d = mus
+            color = traj_colors[i]
+            ax2.plot(mus_2d[:, 0], mus_2d[:, 1], color=color, lw=1.5,
+                     label=f"Traj {i+1} (F={traj['fidelity']:.3f})")
+            ax2.scatter(mus_2d[:, 0], mus_2d[:, 1], color=color, s=30, zorder=4)
+            # Mark start and end
+            ax2.scatter(*mus_2d[0],  color=color, s=80, marker="o", zorder=5)
+            ax2.scatter(*mus_2d[-1], color=color, s=80, marker="D", zorder=5)
+
+        ax2.set_xlabel(xlabel)
+        ax2.set_ylabel(ylabel)
+        ax2.set_title(f"VAE latent space — top-3 beam trajectories  (latent_dim={args.latent_dim})")
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        traj_fig_path = out_dir / "latent_scatter_trajectories.png"
+        fig2.savefig(traj_fig_path, dpi=150)
+        plt.close()
+        print(f"  {traj_fig_path}", flush=True)
     else:
-        mu_states_2d = mu_states
-
-    # Transform GHZ and |000> states to PCA space if latent_dim > 2
-    if mu_states.shape[1] > 2:
-        mu_ghz_pca = pca.transform([mu_ghz])[0]
-        mu_zero_pca = pca.transform([mu_zero])[0]
-    else:
-        mu_ghz_pca = mu_ghz
-        mu_zero_pca = mu_zero
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    sc = ax.scatter(
-        mu_states_2d[:, 0], mu_states_2d[:, 1],
-        c=entanglement_measures, cmap="plasma", alpha=0.4, s=8, label="BFS states"
-    )
-    plt.colorbar(sc, ax=ax, label="Entanglement Measure")
-    ax.scatter(*mu_ghz_pca, color="red", s=120, marker="*", zorder=5, label="GHZ target")
-    ax.scatter(*mu_zero_pca, color="cyan", s=120, marker="^", zorder=5, label="|000>")
-    ax.set_xlabel("PCA 1")
-    ax.set_ylabel("PCA 2")
-    ax.set_title(f"VAE latent space (PCA) — {N} BFS states  (latent_dim={args.latent_dim})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig_path = out_dir / "latent_scatter_pca.png"
-    fig.savefig(fig_path, dpi=150)
-    plt.close()
+        print(f"No beam trajectories found at {traj_path}, skipping trajectory plot.", flush=True)
 
     print(f"\nSaved:", flush=True)
     print(f"  {ckpt_path}", flush=True)
     print(f"  {out_dir / 'latents.npz'}", flush=True)
     print(f"  {fig_path}", flush=True)
-    print(f"  {fig_path_entanglement}", flush=True)
 
 
 if __name__ == "__main__":

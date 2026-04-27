@@ -1,27 +1,27 @@
 """
-Phase 5: Train DQN agent in latent "dream" space.
+Phase 5: Train PPO agent in latent "dream" space.
 
 The agent never touches the quantum simulator. It uses:
-  - World model  f_v(μ, a) → μ'   (trained LatentDynamicsMLP)
-  - Reward       R = -||μ' - μ_ghz||₂
-  - State        μ ∈ R^latent_dim (starting at μ_zero each episode)
-  - Actions      discrete, index into ACTION_NAMES_3Q
-
-Training is pure in-latent DQN with ε-greedy exploration.
-After training, decodes the greedy policy path and prints the action sequence.
+  - World model  f_v(μ, action_enc) → μ'   (LatentDynamicsMLP)
+  - VAE decoder  dec(μ) → shadow (63-dim)   (MlpVAE decoder)
+  - Reward       R = cosine_similarity(dec(μ'), target_shadow)
+  - State        μ ∈ R^latent_dim
+  - Actions      MultiDiscrete([3,3,3,3,3,3])
+                 each param: 0=−ANGLE_INCREMENT, 1=0, 2=+ANGLE_INCREMENT
 
 Usage:
     python RL-world-model/train_rl_agent.py \
-        --world-model RL-world-model/runs/vae/world_model.pt
+        --world-model RL-world-model/runs/world_model/world_model.pt \
+        --vae-ckpt   RL-world-model/runs/vae/vae_checkpoint.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import random
 import sys
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -32,110 +32,132 @@ if "TORCH_CPP_LOG_LEVEL" not in os.environ:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 sys.path.insert(0, str(_REPO))
 
+N_PARAMS  = 6
+N_CHOICES = 3
+ACTION_ENC_DIM = N_PARAMS * N_CHOICES  # 18
+
 
 # ---------------------------------------------------------------------------
-# World model (re-import definition so this file is self-contained)
+# World model (re-import to keep file self-contained)
 # ---------------------------------------------------------------------------
 
-class LatentDynamicsMLP(nn.Module):
-    def __init__(self, latent_dim: int, n_actions: int, hidden: int = 256):
+def _load_world_model_class():
+    spec = importlib.util.spec_from_file_location("train_world_model", _HERE / "train_world_model.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.LatentDynamicsMLP, mod.action_multidiscrete_to_onehot
+
+
+def _load_mlp_vae(ckpt_path: Path, device: torch.device):
+    spec = importlib.util.spec_from_file_location("mlp_vae", _HERE / "mlp_vae.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = mod.MlpVAE(
+        seq_len=int(ckpt["seq_len"]),
+        latent_dim=int(ckpt["latent_dim"]),
+        hidden=int(ckpt["hidden"]),
+    )
+    model.load_state_dict(ckpt["model"])
+    model.to(device)
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# PPO actor-critic
+# ---------------------------------------------------------------------------
+
+class PPOActorCritic(nn.Module):
+    """
+    Shared backbone → separate actor heads (one per rotation parameter) + critic.
+
+    Actor: 6 independent Categorical(3) distributions.
+    Critic: scalar value estimate.
+    """
+
+    def __init__(self, latent_dim: int, hidden: int = 128):
         super().__init__()
         self.latent_dim = latent_dim
-        self.n_actions = n_actions
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + n_actions, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, latent_dim),
-        )
 
-    def forward(self, mu: torch.Tensor, action_onehot: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([mu, action_onehot], dim=-1))
-
-    @torch.no_grad()
-    def step(self, mu: torch.Tensor, action_idx: int) -> torch.Tensor:
-        onehot = torch.zeros(1, self.n_actions, device=mu.device)
-        onehot[0, action_idx] = 1.0
-        return self.net(torch.cat([mu.unsqueeze(0), onehot], dim=-1)).squeeze(0)
-
-
-# ---------------------------------------------------------------------------
-# DQN
-# ---------------------------------------------------------------------------
-
-class QNetwork(nn.Module):
-    def __init__(self, latent_dim: int, n_actions: int, hidden: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Linear(latent_dim, hidden),
+            nn.LayerNorm(hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.SiLU(),
-            nn.Linear(hidden, n_actions),
         )
+        # One linear head per parameter → logits over 3 choices
+        self.actor_heads = nn.ModuleList([
+            nn.Linear(hidden, N_CHOICES) for _ in range(N_PARAMS)
+        ])
+        self.critic = nn.Linear(hidden, 1)
 
-    def forward(self, mu: torch.Tensor) -> torch.Tensor:
-        return self.net(mu)
+    def forward(self, mu: torch.Tensor):
+        h = self.backbone(mu)
+        logits = [head(h) for head in self.actor_heads]   # list of (B, 3)
+        value = self.critic(h).squeeze(-1)                 # (B,)
+        return logits, value
 
+    def get_action_and_logprob(self, mu: torch.Tensor):
+        logits, value = self(mu)
+        dists = [Categorical(logits=l) for l in logits]
+        actions = torch.stack([d.sample() for d in dists], dim=-1)   # (B, 6)
+        log_prob = sum(d.log_prob(actions[:, i]) for i, d in enumerate(dists))  # (B,)
+        entropy  = sum(d.entropy() for d in dists)                    # (B,)
+        return actions, log_prob, entropy, value
 
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.buf = deque(maxlen=capacity)
-
-    def push(self, mu, action, reward, mu_next, done):
-        self.buf.append((mu, action, reward, mu_next, done))
-
-    def sample(self, batch_size: int):
-        batch = random.sample(self.buf, batch_size)
-        mu, a, r, mu_next, done = zip(*batch)
-        return (
-            torch.stack(mu),
-            torch.tensor(a, dtype=torch.long),
-            torch.tensor(r, dtype=torch.float32),
-            torch.stack(mu_next),
-            torch.tensor(done, dtype=torch.float32),
-        )
-
-    def __len__(self):
-        return len(self.buf)
+    def evaluate(self, mu: torch.Tensor, actions: torch.Tensor):
+        """Evaluate log_prob and entropy of given actions."""
+        logits, value = self(mu)
+        dists = [Categorical(logits=l) for l in logits]
+        log_prob = sum(d.log_prob(actions[:, i]) for i, d in enumerate(dists))
+        entropy  = sum(d.entropy() for d in dists)
+        return log_prob, entropy, value
 
 
 # ---------------------------------------------------------------------------
-# Environment (pure latent)
+# Latent environment
 # ---------------------------------------------------------------------------
 
 class LatentEnv:
     """
-    Deterministic latent-space MDP.
+    Latent-space MDP driven by the world model.
 
-    State  : μ ∈ R^latent_dim
-    Action : discrete index 0..n_actions-1
-    Reward : -||μ' - μ_target||₂   (dense distance reward)
-    Done   : dist < success_thresh  or  steps >= max_steps
+    State   : μ ∈ R^latent_dim
+    Action  : (6,) array with values in {0,1,2}
+              where 0=−ANGLE_INCREMENT, 1=0, 2=+ANGLE_INCREMENT
+    Reward  : cosine_similarity(decoder(μ'), ghz_shadow) mapped to [0,1]
+    Done    : reward > success_thresh  or  steps >= max_steps
     """
 
     def __init__(
         self,
-        world_model: LatentDynamicsMLP,
+        world_model,
+        vae_decoder,
         mu_start: torch.Tensor,
-        mu_target: torch.Tensor,
+        ghz_shadow: torch.Tensor,     # (63,) float32 — target shadow vector
+        action_enc_fn,
         max_steps: int = 20,
-        success_thresh: float = 0.01,
+        success_thresh: float = 0.95,
+        device: torch.device = torch.device("cpu"),
     ):
         self.wm = world_model
-        self.mu_start = mu_start.clone()
-        self.mu_target = mu_target.clone()
+        self.decoder = vae_decoder
+        self.mu_start = mu_start.clone().to(device)
+        self.ghz_shadow = ghz_shadow.to(device)
+        self.action_enc_fn = action_enc_fn
         self.max_steps = max_steps
         self.success_thresh = success_thresh
-        self.mu = mu_start.clone()
+        self.device = device
+        self.mu = self.mu_start.clone()
         self.step_count = 0
 
     def reset(self) -> torch.Tensor:
@@ -143,108 +165,176 @@ class LatentEnv:
         self.step_count = 0
         return self.mu.clone()
 
-    def step(self, action: int) -> tuple[torch.Tensor, float, bool]:
-        self.mu = self.wm.step(self.mu, action)
+    @torch.no_grad()
+    def step(self, action: np.ndarray) -> tuple[torch.Tensor, float, bool]:
+        enc = torch.from_numpy(self.action_enc_fn(action)).float().to(self.device)
+        self.mu = self.wm(self.mu.unsqueeze(0), enc.unsqueeze(0)).squeeze(0)
         self.step_count += 1
-        dist = float(torch.norm(self.mu - self.mu_target))
-        reward = -dist
-        done = dist < self.success_thresh or self.step_count >= self.max_steps
+
+        # Decode μ → shadow, compute cosine similarity with target
+        shadow = self.decoder(self.mu.unsqueeze(0)).squeeze(0)
+        reward = float(F.cosine_similarity(
+            shadow.unsqueeze(0), self.ghz_shadow.unsqueeze(0)
+        ).item())
+        # Map from [-1,1] to [0,1]
+        reward = (reward + 1.0) / 2.0
+
+        done = reward >= self.success_thresh or self.step_count >= self.max_steps
         return self.mu.clone(), reward, done
 
+    @torch.no_grad()
+    def fidelity(self) -> float:
+        shadow = self.decoder(self.mu.unsqueeze(0)).squeeze(0)
+        return float(F.cosine_similarity(
+            shadow.unsqueeze(0), self.ghz_shadow.unsqueeze(0)
+        ).item() * 0.5 + 0.5)
+
 
 # ---------------------------------------------------------------------------
-# Training
+# PPO training
 # ---------------------------------------------------------------------------
 
-def train_dqn(
+def compute_gae(
+    rewards: list[float],
+    values: list[float],
+    dones: list[bool],
+    last_value: float,
+    gamma: float = 0.99,
+    lam: float = 0.95,
+) -> tuple[list[float], list[float]]:
+    """Generalised Advantage Estimation."""
+    advantages = []
+    gae = 0.0
+    next_val = last_value
+    for r, v, d in zip(reversed(rewards), reversed(values), reversed(dones)):
+        next_val = 0.0 if d else next_val
+        delta = r + gamma * next_val - v
+        gae = delta + gamma * lam * (0.0 if d else gae)
+        advantages.insert(0, gae)
+        next_val = v
+    returns = [a + v for a, v in zip(advantages, values)]
+    return advantages, returns
+
+
+def train_ppo(
     env: LatentEnv,
-    n_actions: int,
     latent_dim: int,
     device: torch.device,
     *,
-    episodes: int = 5000,
-    batch_size: int = 128,
+    total_steps: int = 200_000,
+    steps_per_update: int = 2048,
+    n_epochs: int = 10,
+    batch_size: int = 256,
     gamma: float = 0.99,
-    lr: float = 1e-3,
-    eps_start: float = 1.0,
-    eps_end: float = 0.05,
-    eps_decay: int = 3000,  # episodes over which ε decays
-    target_update: int = 50,
-    buffer_size: int = 50_000,
-    min_buffer: int = 500,
+    lam: float = 0.95,
+    clip_eps: float = 0.2,
+    lr: float = 3e-4,
+    vf_coef: float = 0.5,
+    ent_coef: float = 0.01,
     hidden: int = 128,
-    log_every: int = 200,
-) -> tuple[QNetwork, list[float]]:
-    q_net = QNetwork(latent_dim, n_actions, hidden=hidden).to(device)
-    q_target = QNetwork(latent_dim, n_actions, hidden=hidden).to(device)
-    q_target.load_state_dict(q_net.state_dict())
-    q_target.eval()
+    log_every: int = 5,
+) -> PPOActorCritic:
+    policy = PPOActorCritic(latent_dim, hidden=hidden).to(device)
+    opt = torch.optim.Adam(policy.parameters(), lr=lr)
 
-    opt = torch.optim.Adam(q_net.parameters(), lr=lr)
-    buf = ReplayBuffer(buffer_size)
-    episode_returns = []
-    successes = []
+    updates = total_steps // steps_per_update
+    mu = env.reset().to(device)
+    ep_rewards: list[float] = []
+    ep_successes: list[bool] = []
+    cur_ep_reward = 0.0
+    update_count = 0
 
-    for ep in range(episodes):
-        eps = eps_end + (eps_start - eps_end) * max(0.0, 1.0 - ep / eps_decay)
-        mu = env.reset().to(device)
-        ep_return = 0.0
+    for update in range(1, updates + 1):
+        # --- Collect rollout ---
+        buf_mu, buf_actions, buf_logp, buf_vals = [], [], [], []
+        buf_rewards, buf_dones = [], []
 
-        while True:
-            # ε-greedy
-            if random.random() < eps:
-                action = random.randrange(n_actions)
-            else:
-                with torch.no_grad():
-                    action = int(q_net(mu.unsqueeze(0)).argmax(dim=1).item())
+        for _ in range(steps_per_update):
+            mu_t = mu.detach()
+            with torch.no_grad():
+                actions, log_prob, _, value = policy.get_action_and_logprob(mu_t.unsqueeze(0))
+            action_np = actions[0].cpu().numpy()
 
-            mu_next, reward, done = env.step(action)
+            mu_next, reward, done = env.step(action_np)
             mu_next = mu_next.to(device)
-            buf.push(mu.cpu(), action, reward, mu_next.cpu(), float(done))
-            mu = mu_next
-            ep_return += reward
 
-            if len(buf) >= min_buffer:
-                mu_b, a_b, r_b, mun_b, d_b = buf.sample(batch_size)
-                mu_b = mu_b.to(device)
-                a_b = a_b.to(device)
-                r_b = r_b.to(device)
-                mun_b = mun_b.to(device)
-                d_b = d_b.to(device)
+            buf_mu.append(mu_t)
+            buf_actions.append(actions[0])
+            buf_logp.append(log_prob[0])
+            buf_vals.append(value[0])
+            buf_rewards.append(reward)
+            buf_dones.append(done)
 
-                with torch.no_grad():
-                    q_next = q_target(mun_b).max(dim=1).values
-                    q_tgt = r_b + gamma * q_next * (1 - d_b)
+            cur_ep_reward += reward
+            if done:
+                ep_rewards.append(cur_ep_reward)
+                ep_successes.append(env.fidelity() >= env.success_thresh)
+                cur_ep_reward = 0.0
+                mu = env.reset().to(device)
+            else:
+                mu = mu_next
 
-                q_pred = q_net(mu_b).gather(1, a_b.unsqueeze(1)).squeeze(1)
-                loss = F.mse_loss(q_pred, q_tgt)
+        # Bootstrap value for last state
+        with torch.no_grad():
+            _, last_val = policy(mu.unsqueeze(0))
+            last_val = float(last_val[0])
+
+        advantages, returns = compute_gae(
+            buf_rewards,
+            [float(v) for v in buf_vals],
+            buf_dones,
+            last_val,
+            gamma=gamma, lam=lam,
+        )
+
+        # Convert buffers to tensors
+        t_mu      = torch.stack(buf_mu)                                     # (T, latent_dim)
+        t_actions = torch.stack(buf_actions)                                # (T, 6)
+        t_logp    = torch.stack(buf_logp)                                   # (T,)
+        t_adv     = torch.tensor(advantages, dtype=torch.float32, device=device)
+        t_ret     = torch.tensor(returns,    dtype=torch.float32, device=device)
+        t_adv     = (t_adv - t_adv.mean()) / (t_adv.std() + 1e-8)
+
+        # --- PPO update ---
+        T = len(t_mu)
+        perm = torch.randperm(T, device=device)
+        for _ in range(n_epochs):
+            for start in range(0, T, batch_size):
+                idx = perm[start:start + batch_size]
+                b_mu      = t_mu[idx]
+                b_actions = t_actions[idx]
+                b_old_lp  = t_logp[idx].detach()
+                b_adv     = t_adv[idx]
+                b_ret     = t_ret[idx]
+
+                new_lp, entropy, new_val = policy.evaluate(b_mu, b_actions)
+
+                ratio = (new_lp - b_old_lp).exp()
+                pg1 = ratio * b_adv
+                pg2 = ratio.clamp(1 - clip_eps, 1 + clip_eps) * b_adv
+                actor_loss = -torch.min(pg1, pg2).mean()
+
+                critic_loss = F.mse_loss(new_val, b_ret)
+                ent_loss    = -entropy.mean()
+
+                loss = actor_loss + vf_coef * critic_loss + ent_coef * ent_loss
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
                 opt.step()
 
-            if done:
-                dist = float(torch.norm(mu - env.mu_target.to(device)))
-                successes.append(dist < env.success_thresh)
-                break
-
-        episode_returns.append(ep_return)
-
-        if ep % target_update == 0:
-            q_target.load_state_dict(q_net.state_dict())
-
-        if ep % log_every == 0 or ep == episodes - 1:
-            recent = episode_returns[-log_every:]
-            succ_rate = np.mean(successes[-log_every:]) if successes else 0.0
-            dist_now = float(torch.norm(mu - env.mu_target.to(device)))
+        update_count += 1
+        if update_count % log_every == 0 or update == updates:
+            recent_rewards = ep_rewards[-50:] if ep_rewards else [0.0]
+            succ_rate = np.mean(ep_successes[-50:]) if ep_successes else 0.0
             print(
-                f"Episode {ep:5d} | ε={eps:.3f} | "
-                f"avg_ret={np.mean(recent):.3f} | "
+                f"Update {update:4d}/{updates} | "
+                f"avg_reward={np.mean(recent_rewards):.3f} | "
                 f"success={succ_rate*100:.1f}% | "
-                f"d_target={dist_now:.4f}"
+                f"fidelity={env.fidelity():.4f}"
             )
 
-    return q_net, episode_returns
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -253,26 +343,24 @@ def train_dqn(
 
 @torch.no_grad()
 def greedy_rollout(
-    q_net: QNetwork,
+    policy: PPOActorCritic,
     env: LatentEnv,
-    action_names: list[str],
     device: torch.device,
     max_steps: int = 30,
-) -> list[str]:
-    """Follow greedy policy from start and print path."""
+) -> list[np.ndarray]:
     mu = env.reset().to(device)
     path = []
     print("\nGreedy policy rollout:")
-    dist0 = float(torch.norm(mu - env.mu_target.to(device)))
-    print(f"  start  d={dist0:.4f}  μ={mu.cpu().numpy()}")
+    print(f"  start  fid={env.fidelity():.4f}  μ={mu.cpu().numpy()}")
     for _ in range(max_steps):
-        action = int(q_net(mu.unsqueeze(0)).argmax(dim=1).item())
-        mu_next, _, done = env.step(action)
+        logits, _ = policy(mu.unsqueeze(0))
+        action_np = np.array([int(l.argmax().item()) for l in logits])
+        mu_next, reward, done = env.step(action_np)
         mu = mu_next.to(device)
-        dist = float(torch.norm(mu - env.mu_target.to(device)))
-        act_name = action_names[action]
-        path.append(act_name)
-        print(f"  → {act_name:<6}  d={dist:.4f}  μ={mu.cpu().numpy()}")
+        path.append(action_np)
+        delta_names = ["−δ", " 0", "+δ"]
+        act_str = " ".join(f"p{p}:{delta_names[action_np[p]]}" for p in range(N_PARAMS))
+        print(f"  step {len(path):2d}: [{act_str}]  reward={reward:.4f}  fid={env.fidelity():.4f}")
         if done:
             break
     return path
@@ -283,22 +371,28 @@ def greedy_rollout(
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train DQN agent in latent dream space")
+    p = argparse.ArgumentParser(description="Phase 5: Train PPO agent in latent dream space")
     p.add_argument("--world-model", type=Path, required=True,
                    help="world_model.pt from train_world_model.py")
-    p.add_argument("--episodes", type=int, default=5000)
+    p.add_argument("--vae-ckpt", type=Path, required=True,
+                   help="vae_checkpoint.pt from train_vae.py")
+    p.add_argument("--total-steps", type=int, default=200_000)
+    p.add_argument("--steps-per-update", type=int, default=2048)
+    p.add_argument("--n-epochs", type=int, default=10)
     p.add_argument("--max-steps", type=int, default=20,
-                   help="Max steps per episode (GHZ needs 7 min, pad for exploration)")
-    p.add_argument("--success-thresh", type=float, default=0.02,
-                   help="Latent distance to GHZ counted as success")
+                   help="Max steps per episode")
+    p.add_argument("--success-thresh", type=float, default=0.95,
+                   help="Shadow cosine similarity [0,1] counted as success")
     p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--eps-decay", type=int, default=3000)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=Path, default=None)
+    p.add_argument("--log-every", type=int, default=5)
     return p.parse_args()
 
 
@@ -319,64 +413,85 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    # --- Load world model ---
-    ckpt = torch.load(args.world_model, map_location="cpu", weights_only=False)
-    latent_dim = int(ckpt["latent_dim"])
-    n_actions = int(ckpt["n_actions"])
-    hidden = int(ckpt["hidden"])
-    action_names = list(ckpt["action_names"])
-    mu_ghz = torch.from_numpy(ckpt["mu_ghz"]).float()
-    mu_zero = torch.from_numpy(ckpt["mu_zero"]).float()
-
     device = _pick_device(args.device)
-    world_model = LatentDynamicsMLP(latent_dim, n_actions, hidden=hidden).to(device)
-    world_model.load_state_dict(ckpt["model"])
+
+    # --- Load world model ---
+    LatentDynamicsMLP, action_enc_fn = _load_world_model_class()
+    wm_ckpt = torch.load(args.world_model, map_location="cpu", weights_only=False)
+    latent_dim = int(wm_ckpt["latent_dim"])
+    hidden_wm  = int(wm_ckpt["hidden"])
+
+    world_model = LatentDynamicsMLP(latent_dim, hidden=hidden_wm).to(device)
+    world_model.load_state_dict(wm_ckpt["model"])
     world_model.eval()
 
-    print(f"World model: latent_dim={latent_dim}, n_actions={n_actions}")
-    print(f"μ_zero  = {mu_zero.numpy()}")
-    print(f"μ_GHZ   = {mu_ghz.numpy()}")
-    print(f"dist(zero→GHZ) = {float(torch.norm(mu_zero - mu_ghz)):.4f}")
-    print(f"Actions: {action_names}")
+    mu_ghz  = torch.from_numpy(wm_ckpt["mu_ghz"].astype(np.float32))
+    mu_zero = torch.from_numpy(wm_ckpt["mu_zero"].astype(np.float32))
+    print(f"World model: latent_dim={latent_dim}")
+    print(f"μ_zero = {mu_zero.numpy()}")
+    print(f"μ_GHZ  = {mu_ghz.numpy()}")
+
+    # --- Load VAE decoder ---
+    vae = _load_mlp_vae(args.vae_ckpt, device)
+
+    # --- Compute GHZ shadow target ---
+    sf_spec = importlib.util.spec_from_file_location("shadow_fingerprint", _HERE / "shadow_fingerprint.py")
+    sf_mod = importlib.util.module_from_spec(sf_spec)
+    sf_spec.loader.exec_module(sf_mod)
+
+    rng_fp = np.random.default_rng(args.seed)
+    ghz_fp = sf_mod.shadow_fingerprint_batch(
+        sf_mod.prepare_ghz_state(3), 3,
+        n_shots_per_sample=1024, n_samples=64, rng=rng_fp,
+    ).mean(axis=0)   # (63,) — averaged reference shadow
+    ghz_shadow = torch.from_numpy(ghz_fp).float().to(device)
+
+    print(f"GHZ shadow norm: {float(ghz_shadow.norm()):.4f}")
 
     # --- Build environment ---
     env = LatentEnv(
         world_model=world_model,
+        vae_decoder=vae.decoder,
         mu_start=mu_zero.to(device),
-        mu_target=mu_ghz.to(device),
+        ghz_shadow=ghz_shadow,
+        action_enc_fn=action_enc_fn,
         max_steps=args.max_steps,
         success_thresh=args.success_thresh,
+        device=device,
     )
 
-    # --- Train DQN ---
-    print(f"\nTraining DQN: {args.episodes} episodes, max_steps={args.max_steps}, "
-          f"success_thresh={args.success_thresh}, device={device}")
-    q_net, returns = train_dqn(
-        env, n_actions, latent_dim, device,
-        episodes=args.episodes,
+    # --- Train PPO ---
+    print(f"\nTraining PPO: total_steps={args.total_steps}, "
+          f"steps_per_update={args.steps_per_update}, "
+          f"max_ep_steps={args.max_steps}, device={device}")
+    policy = train_ppo(
+        env, latent_dim, device,
+        total_steps=args.total_steps,
+        steps_per_update=args.steps_per_update,
+        n_epochs=args.n_epochs,
         batch_size=args.batch_size,
         gamma=args.gamma,
+        clip_eps=args.clip_eps,
         lr=args.lr,
-        eps_decay=args.eps_decay,
+        ent_coef=args.ent_coef,
         hidden=args.hidden,
-        log_every=max(1, args.episodes // 25),
+        log_every=args.log_every,
     )
 
     # --- Greedy rollout ---
-    path = greedy_rollout(q_net, env, action_names, device)
-    print(f"\nFound gate sequence: {' → '.join(path)}")
+    path = greedy_rollout(policy, env, device)
 
     # --- Save ---
-    out_dir = args.out_dir if args.out_dir is not None else args.world_model.parent
+    out_dir = args.out_dir if args.out_dir is not None else _HERE / "runs" / "ppo_agent"
     out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "dqn_agent.pt"
+    ckpt_path = out_dir / "ppo_agent.pt"
     torch.save({
-        "model": q_net.state_dict(),
+        "model": policy.state_dict(),
         "latent_dim": latent_dim,
-        "n_actions": n_actions,
         "hidden": args.hidden,
-        "action_names": action_names,
-        "gate_sequence": path,
+        "n_params": N_PARAMS,
+        "n_choices": N_CHOICES,
+        "action_sequence": [a.tolist() for a in path],
         "mu_ghz": mu_ghz.numpy(),
         "mu_zero": mu_zero.numpy(),
     }, ckpt_path)
@@ -384,15 +499,12 @@ def main() -> None:
     # --- Training curve ---
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8, 4))
-    window = max(1, len(returns) // 100)
-    smoothed = np.convolve(returns, np.ones(window) / window, mode="valid")
-    ax.plot(smoothed, lw=1.5)
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Episode return")
-    ax.set_title("DQN latent-dream training curve")
+    ax.set_xlabel("PPO update")
+    ax.set_ylabel("Avg episode reward (last 50 eps)")
+    ax.set_title("PPO latent-dream training")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig_path = out_dir / "dqn_training_curve.png"
+    fig_path = out_dir / "ppo_training_curve.png"
     fig.savefig(fig_path, dpi=150)
     plt.close()
 

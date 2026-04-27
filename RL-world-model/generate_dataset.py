@@ -1,27 +1,29 @@
 """
-Phase 2: BFS transition-graph dataset generator (shadow fingerprints).
+Phase 2: Dataset generator from beam-search trajectories.
 
-Explores quantum state space reachable from |00...0⟩ by BFS over the action set,
-deduplicates statevectors (global-phase invariant), shadow-fingerprints each unique
-state, and stores the full transition table.
+Loads the beam-search trajectories (Phase 1), executes the intermediate circuits,
+measures shadow fingerprints, and constructs the transition dataset:
+    (x_{k,n}, a_{k,n}, x_{k,n+1})
+
+where:
+    x_{k,n}   = 63-dim shadow fingerprint of trajectory k after round n
+    a_{k,n}   = 6-dim angle delta applied at round n+1  (values in {-ANGLE_INCREMENT, 0, +ANGLE_INCREMENT})
+    x_{k,n+1} = 63-dim shadow fingerprint after round n+1
 
 Dataset format (saved as .npz):
-    fingerprints  : (N, n_samples, 36) float32  — shadow features per unique state
-    transitions   : (N, A) int32  — transitions[i, j] = next state index (-1 = frontier)
-    n_qubits      : int
-    n_shots_per_sample : int      — random Pauli shots per shadow sample
-    n_samples     : int           — independent shadow samples per state
-    n_features    : int           — 36 (9 one-local + 27 two-local Pauli expectations)
-    action_names  : (A,) str
-    depths        : (N,) int32    — BFS depth each state was discovered at
-
-For RL:
-    z[i] = encoder(fingerprints[i])          # latent of state i
-    z_next = z[transitions[i, j]]            # latent after action j from state i
-    reward = -||z_next - z_target||          # distance to target
+    fingerprints   : (M, 63)  float32  — shadow features at each step
+    next_fps       : (M, 63)  float32  — shadow features after action
+    actions        : (M, 6)   float32  — angle deltas (raw float, multiples of ANGLE_INCREMENT)
+    action_indices : (M, 6)   int8     — discretised actions: {-1, 0, +1}
+    traj_ids       : (M,)     int32    — which trajectory each sample came from
+    round_ids      : (M,)     int32    — which round (0-indexed) each sample came from
+    distances      : (M,)     float32  — trace distance of next state with GHZ
+    n_features     : int      — 63
+    n_params       : int      — 6
+    angle_increment: float
 
 Usage:
-    python generate_dataset.py --max-states 5000 --max-depth 8
+    python generate_dataset.py --trajectories data/beam_trajectories.npz
 """
 
 from __future__ import annotations
@@ -29,328 +31,220 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import time
-from collections import deque
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# Load multiqubit_fingerprint from sibling file (avoids package install)
-# ---------------------------------------------------------------------------
 
 _HERE = Path(__file__).resolve().parent
 
 
-def _load_mf():
-    spec = importlib.util.spec_from_file_location(
-        "multiqubit_fingerprint", _HERE / "multiqubit_fingerprint.py"
-    )
+# ---------------------------------------------------------------------------
+# Module loaders
+# ---------------------------------------------------------------------------
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-mf = _load_mf()
-
-
-def _load_sf():
-    spec = importlib.util.spec_from_file_location(
-        "shadow_fingerprint", _HERE / "shadow_fingerprint.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-sf = _load_sf()
+bs = _load_module("beam_search", _HERE / "beam_search.py")
+sf = _load_module("shadow_fingerprint", _HERE / "shadow_fingerprint.py")
 
 
 # ---------------------------------------------------------------------------
-# Statevector deduplication
+# Core
 # ---------------------------------------------------------------------------
 
-_HASH_DECIMALS = 6  # round to 1e-6 before hashing — handles floating point drift
-
-
-def _sv_hash(sv_data: np.ndarray) -> bytes:
-    """
-    Global-phase-invariant hash of a statevector.
-
-    Fixes global phase by rotating so the first nonzero element is real positive,
-    then rounds to _HASH_DECIMALS and hashes the byte representation.
-    """
-    arr = np.asarray(sv_data, dtype=np.complex128)
-    # Find first nonzero element to fix global phase
-    nz = np.flatnonzero(np.abs(arr) > 1e-9)
-    if len(nz):
-        phase = arr[nz[0]] / np.abs(arr[nz[0]])
-        arr = arr / phase
-    # Round real and imag separately, pack as float32 for compact hashing
-    arr_r = np.round(arr.real, _HASH_DECIMALS).astype(np.float32)
-    arr_i = np.round(arr.imag, _HASH_DECIMALS).astype(np.float32)
-    return arr_r.tobytes() + arr_i.tobytes()
-
-
-# ---------------------------------------------------------------------------
-# BFS
-# ---------------------------------------------------------------------------
-
-
-def bfs_state_graph(
-    initial_sv,
-    action_names: Sequence[str],
-    *,
-    max_depth: int = 8,
-    max_states: int = 5000,
+def build_transition_dataset(
+    trajectories: list,
+    n_shots_per_sample: int = 1024,
+    n_samples: int = 1,
+    rng: np.random.Generator | None = None,
     verbose: bool = True,
-) -> Tuple[List, np.ndarray, np.ndarray]:
+) -> dict:
     """
-    BFS from initial_sv over action_names.
+    Build (x_kn, a_kn, x_kn+1) transition dataset from beam-search trajectories.
 
-    Returns
-    -------
-    statevectors : list of Statevector objects, length N
-    transitions  : (N, A) int32 — transitions[i, j] = index of a_j(state_i)
-    depths       : (N,) int32
-    """
-    A = len(action_names)
-    hash_to_idx = {}
-    statevectors = []
-    depths_list = []
-
-    def _register(sv, depth: int) -> int:
-        h = _sv_hash(sv.data)
-        if h not in hash_to_idx:
-            idx = len(statevectors)
-            hash_to_idx[h] = idx
-            statevectors.append(sv)
-            depths_list.append(depth)
-        return hash_to_idx[h]
-
-    root_idx = _register(initial_sv, 0)
-    # Queue: (sv, depth, state_idx)
-    queue = deque([(initial_sv, 0, root_idx)])
-
-    # transitions[i, j] = -1 means not yet computed
-    # We grow this dynamically; preallocate with max_states rows
-    _cap = max_states
-    transitions = np.full((_cap, A), -1, dtype=np.int32)
-
-    t0 = time.time()
-    processed = 0
-
-    while queue:
-        sv, depth, i = queue.popleft()
-        processed += 1
-
-        if verbose and processed % 500 == 0:
-            elapsed = time.time() - t0
-            print(
-                f"  BFS: processed={processed}, states={len(statevectors)}, "
-                f"queue={len(queue)}, depth={depth}, elapsed={elapsed:.1f}s"
-            )
-
-        for j, action in enumerate(action_names):
-            sv_next = mf.apply_action(sv, action)
-            next_idx = _register(sv_next, depth + 1)
-
-            if i < _cap:
-                transitions[i, j] = next_idx
-
-            # Expand next state only if within depth limit and not yet queued
-            if depth + 1 < max_depth and len(statevectors) < max_states:
-                # Only enqueue if newly discovered (depths_list just grew)
-                if depths_list[next_idx] == depth + 1 and next_idx == len(statevectors) - 1:
-                    queue.append((sv_next, depth + 1, next_idx))
-
-        if len(statevectors) >= max_states:
-            if verbose:
-                print(f"  BFS: hit max_states={max_states}, stopping expansion.")
-            break
-
-    N = len(statevectors)
-    if verbose:
-        print(f"BFS done: {N} unique states, {processed} nodes processed, "
-              f"{time.time() - t0:.1f}s")
-
-    return statevectors, transitions[:N], np.array(depths_list, dtype=np.int32)
-
-
-# ---------------------------------------------------------------------------
-# Fingerprint all states
-# ---------------------------------------------------------------------------
-
-
-def fingerprint_all_states(
-    statevectors: List,
-    n_qubits: int,
-    n_shots_per_sample: int,
-    n_samples: int,
-    rng: np.random.Generator,
-    verbose: bool = True,
-) -> np.ndarray:
-    """
-    Shadow-fingerprint every statevector.
-
-    Returns
-    -------
-    fingerprints : (N, n_samples, 36) float32
-    """
-    N = len(statevectors)
-    fingerprints = np.zeros((N, n_samples, sf.N_FEATURES), dtype=np.float32)
-
-    t0 = time.time()
-    for i, sv in enumerate(statevectors):
-        fingerprints[i] = sf.shadow_fingerprint_batch(
-            sv, n_qubits, n_shots_per_sample=n_shots_per_sample,
-            n_samples=n_samples, rng=rng,
-        )
-        if verbose and (i + 1) % 100 == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            eta = (N - i - 1) / rate
-            print(f"  Fingerprint {i+1}/{N}  ({rate:.1f} states/s, ETA {eta:.0f}s)")
-
-    if verbose:
-        print(f"Fingerprinting done: {N} states in {time.time()-t0:.1f}s")
-    return fingerprints
-
-
-# ---------------------------------------------------------------------------
-# Compute entanglement entropy
-# ---------------------------------------------------------------------------
-
-
-def compute_entanglement_entropy(sv, subsystem: List[int]) -> float:
-    """
-    Compute the entanglement entropy of a quantum state.
+    Each trajectory has n_rounds rounds. We collect transitions for rounds 0..n_rounds-2.
+    At each step:
+      - fingerprint the state after round n     → x_kn
+      - fingerprint the state after round n+1   → x_kn+1
+      - action = angle delta for round n+1      → a_kn
 
     Parameters
     ----------
-    sv : Statevector
-        The quantum state.
-    subsystem : list of int
-        The qubits that form the subsystem (for bipartite entanglement).
-
-    Returns
-    -------
-    float
-        The entanglement entropy of the state.
+    trajectories : list of dicts from beam_search.load_trajectories
+    n_shots_per_sample : Pauli shots per shadow sample
+    n_samples : independent shadow samples per state (averaged for VAE training)
+    rng : random generator
+    verbose : print progress
     """
-    from qiskit.quantum_info import partial_trace, entropy
+    if rng is None:
+        rng = np.random.default_rng()
 
-    # Compute the reduced density matrix for the subsystem
-    print(sv)
-    reduced_density_matrix = partial_trace(sv, qargs=subsystem)
+    fps_list = []
+    next_fps_list = []
+    actions_list = []
+    action_idx_list = []
+    traj_ids = []
+    round_ids = []
+    distances_list = []
 
-    # Compute the eigenvalues of the reduced density matrix
-    eigenvalues = np.linalg.eigvalsh(reduced_density_matrix)
+    angle_increment = float(bs.ANGLE_INCREMENT)
+    n_qubits = bs.N_QUBITS
 
-    # Compute the entanglement entropy: -Tr(rho_subsystem log(rho_subsystem))
-    entropy_value = -np.sum(eigenvalues * np.log(eigenvalues + 1e-10))
+    t0 = time.time()
+    total_steps = sum(max(0, len(t["distance_history"]) - 1) for t in trajectories)
+    done_steps = 0
 
-    return entropy_value
+    for k, traj in enumerate(trajectories):
+        angle_schedule = traj["angle_schedule"]   # (n_rounds, 6)
+        actions = traj["actions"]                  # (n_rounds, 6)
+        distance_history = traj["distance_history"]
+        n_rounds = angle_schedule.shape[0]
+
+        for n in range(n_rounds - 1):
+            # State after round n
+            sched_n = angle_schedule[:n + 1]
+            qc_n = bs.build_ansatz_circuit(sched_n)
+            from qiskit.quantum_info import Statevector
+            sv_n = Statevector(qc_n)
+
+            # State after round n+1
+            sched_n1 = angle_schedule[:n + 2]
+            qc_n1 = bs.build_ansatz_circuit(sched_n1)
+            sv_n1 = Statevector(qc_n1)
+
+            # Shadow fingerprints: average over n_samples
+            fp_n = sf.shadow_fingerprint_batch(
+                sv_n, n_qubits, n_shots_per_sample=n_shots_per_sample,
+                n_samples=n_samples, rng=rng,
+            ).mean(axis=0)   # (63,)
+
+            fp_n1 = sf.shadow_fingerprint_batch(
+                sv_n1, n_qubits, n_shots_per_sample=n_shots_per_sample,
+                n_samples=n_samples, rng=rng,
+            ).mean(axis=0)   # (63,)
+
+            # Action: delta at round n+1
+            action_delta = actions[n + 1]   # (6,) floats in {-π/18, 0, +π/18}
+            action_idx = np.round(action_delta / angle_increment).astype(np.int8)  # {-1, 0, +1}
+
+            fps_list.append(fp_n)
+            next_fps_list.append(fp_n1)
+            actions_list.append(action_delta.astype(np.float32))
+            action_idx_list.append(action_idx)
+            traj_ids.append(k)
+            round_ids.append(n)
+            distances_list.append(float(distance_history[n + 1]))
+
+            done_steps += 1
+            if verbose and done_steps % 20 == 0:
+                rate = done_steps / (time.time() - t0 + 1e-9)
+                print(f"  Steps {done_steps}/{total_steps}  ({rate:.1f} steps/s)")
+
+    if verbose:
+        print(f"Dataset built: {len(fps_list)} transitions in {time.time()-t0:.1f}s")
+
+    return {
+        "fingerprints":    np.array(fps_list, dtype=np.float32),
+        "next_fps":        np.array(next_fps_list, dtype=np.float32),
+        "actions":         np.array(actions_list, dtype=np.float32),
+        "action_indices":  np.array(action_idx_list, dtype=np.int8),
+        "traj_ids":        np.array(traj_ids, dtype=np.int32),
+        "round_ids":       np.array(round_ids, dtype=np.int32),
+        "distances":       np.array(distances_list, dtype=np.float32),
+        "n_features":      np.array(sf.N_FEATURES),
+        "n_params":        np.array(bs.N_PARAMS),
+        "angle_increment": np.array(angle_increment),
+    }
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate BFS transition-graph fingerprint dataset")
-    p.add_argument("--n-qubits", type=int, default=3)
-    p.add_argument("--max-depth", type=int, default=10,
-                   help="BFS depth limit (default 10)")
-    p.add_argument("--max-states", type=int, default=1500,
-                   help="Hard cap on unique states (default 15000)")
-    p.add_argument("--n-shots-per-sample", type=int, default=128,
-                   help="Random Pauli shots per shadow sample (default 256)")
-    p.add_argument("--n-samples", type=int, default=1,
-                   help="Independent shadow samples per state (default 16)")
+    p = argparse.ArgumentParser(description="Phase 2: Build transition dataset from beam trajectories")
+    p.add_argument("--trajectories", type=Path, default=None,
+                   help=".npz from beam_search.py (default: data/beam_trajectories.npz)")
+    p.add_argument("--n-shots-per-sample", type=int, default=256)
+    p.add_argument("--n-samples", type=int, default=4,
+                   help="Independent shadow samples per state (averaged)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, default=None,
-                   help="Output .npz path (default: RL-world-model/data/bfs_dataset.npz)")
-    p.add_argument("--actions", nargs="+", default=None,
-                   help="Override action set (default: all 9 for 3-qubit system)")
+                   help="Output .npz path (default: data/transition_dataset.npz)")
     p.add_argument("--quiet", action="store_true")
+    # Optionally run beam search on-the-fly
+    p.add_argument("--beam-width", type=int, default=None,
+                   help="If set, run beam search instead of loading from file")
+    p.add_argument("--max-rounds", type=int, default=bs.MAX_ROUNDS)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     verbose = not args.quiet
-
-    action_names = args.actions if args.actions is not None else mf.ACTION_NAMES_3Q
     rng = np.random.default_rng(args.seed)
+    data_dir = _HERE / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    out_path = args.out
-    if out_path is None:
-        data_dir = _HERE / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        out_path = data_dir / "bfs_dataset.npz"
+    # --- Load or generate beam trajectories ---
+    if args.beam_width is not None:
+        if verbose:
+            print(f"Running beam search (beam_width={args.beam_width}, max_rounds={args.max_rounds})...")
+        trajectories = bs.beam_search(
+            beam_width=args.beam_width,
+            max_rounds=args.max_rounds,
+            verbose=verbose,
+        )
+        traj_path = data_dir / "beam_trajectories.npz"
+        bs.save_trajectories(traj_path, trajectories)
+        if verbose:
+            print(f"Trajectories saved to {traj_path}")
+    else:
+        traj_path = args.trajectories or data_dir / "beam_trajectories.npz"
+        if not traj_path.exists():
+            raise FileNotFoundError(
+                f"Trajectories not found at {traj_path}. "
+                "Run beam_search.py first or pass --beam-width."
+            )
+        if verbose:
+            print(f"Loading trajectories from {traj_path}...")
+        trajectories = bs.load_trajectories(traj_path)
 
- 
-    # --- BFS ---
-    initial_sv = mf.prepare_zero_state(args.n_qubits)
     if verbose:
-        print("Starting BFS from |00...0>...")
-    statevectors, transitions, depths = bfs_state_graph(
-        initial_sv,
-        action_names,
-        max_depth=args.max_depth,
-        max_states=args.max_states,
-        verbose=verbose,
-    )
-    N = len(statevectors)
+        print(f"Loaded {len(trajectories)} trajectories")
+        total_rounds = sum(len(t["distance_history"]) for t in trajectories)
+        print(f"  Total rounds: {total_rounds}  "
+              f"  Total transitions: {total_rounds - len(trajectories)}")
 
-    # --- Shadow fingerprint ---
+    # --- Build dataset ---
     if verbose:
-        print(f"Fingerprinting {N} states "
+        print(f"Building transition dataset "
               f"(n_shots_per_sample={args.n_shots_per_sample}, n_samples={args.n_samples})...")
-    fingerprints = fingerprint_all_states(
-        statevectors,
-        args.n_qubits,
-        args.n_shots_per_sample,
-        args.n_samples,
+    dataset = build_transition_dataset(
+        trajectories,
+        n_shots_per_sample=args.n_shots_per_sample,
+        n_samples=args.n_samples,
         rng=rng,
         verbose=verbose,
     )
 
-    # --- Compute entanglement entropy ---
-    if verbose:
-        print(f"Computing entanglement entropy for {N} states...")
-    entanglement_measures = [
-        compute_entanglement_entropy(sv, subsystem=list(range(args.n_qubits // 2)))
-        for sv in statevectors
-    ]
-
     # --- Save ---
-    np.savez_compressed(
-        out_path,
-        fingerprints=fingerprints,
-        transitions=transitions,
-        depths=depths,
-        action_names=np.array(action_names),
-        n_qubits=np.array(args.n_qubits),
-        n_shots_per_sample=np.array(args.n_shots_per_sample),
-        n_samples=np.array(args.n_samples),
-        n_features=np.array(sf.N_FEATURES),
-        max_depth=np.array(args.max_depth),
-        entanglement_measures=np.array(entanglement_measures, dtype=np.float32),
-    )
-
+    out_path = args.out or data_dir / "transition_dataset.npz"
+    np.savez_compressed(out_path, **dataset)
     size_mb = out_path.stat().st_size / 1e6
+
     if verbose:
+        M = len(dataset["fingerprints"])
         print(f"\nSaved: {out_path}  ({size_mb:.1f} MB)")
-        print(f"  fingerprints : {fingerprints.shape}  float32  "
-              f"[{fingerprints.min():.3f}, {fingerprints.max():.3f}]")
-        print(f"  transitions  : {transitions.shape}  int32")
-        print(f"  depths       : depth 0..{depths.max()}  (histogram: "
-              + ", ".join(f"d{d}={int((depths==d).sum())}"
-                          for d in range(depths.max()+1)) + ")")
-        print(f"  actions      : {action_names}")
+        print(f"  transitions    : {M}")
+        print(f"  fingerprints   : {dataset['fingerprints'].shape}  "
+              f"[{dataset['fingerprints'].min():.3f}, {dataset['fingerprints'].max():.3f}]")
+        print(f"  distance range : [{dataset['distances'].min():.4f}, {dataset['distances'].max():.4f}]")
 
 
 if __name__ == "__main__":

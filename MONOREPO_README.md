@@ -21,3 +21,10 @@ experimental code previously at the project root has been moved under
 top-level shims (`ML`, `quantum_code`) were added to preserve backwards
 compatible imports. The original README content was migrated into
 `calibration-gym/README.md`.
+
+Continuous integration
+----------------------
+This repository includes a minimal CI workflow that runs a lightweight import
+smoke test to ensure the top-level shims remain importable. The workflow is
+defined in `.github/workflows/ci.yml` and runs on pushes/PRs against `main` and
+the reorg branch.

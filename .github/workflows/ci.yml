@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ "chore/reorg-monorepo", "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+      - name: Run import smoke tests
+        run: |
+          pytest -q

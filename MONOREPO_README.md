@@ -12,3 +12,12 @@ Subprojects:
 - `preparation-gym` - ansatz and circuit preparation utilities
 
 See subproject READMEs for more details.
+
+Note on recent reorganization
+-----------------------------
+The repository was reorganized into a monorepo layout. The primary ML and
+experimental code previously at the project root has been moved under
+`calibration-gym/` (subfolders `ML/` and `quantum_code/`). A small set of
+top-level shims (`ML`, `quantum_code`) were added to preserve backwards
+compatible imports. The original README content was migrated into
+`calibration-gym/README.md`.

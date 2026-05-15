@@ -1,11 +1,10 @@
-"""Compatibility shim for top-level `quantum_code` package.
+"""Top-level shim for backwards compatibility.
 
-This file keeps existing imports working after the folder was moved to
-`calibration-gym/quantum_code` by adjusting the package search path.
+Re-exports the implementation moved to `calibration-gym/quantum_code` so
+imports like `import quantum_code` continue to work.
 """
-from pathlib import Path
+import importlib
+import pkgutil
+__path__.insert(0, importlib.import_module('os').path.join(importlib.import_module('os').path.dirname(__file__), '..', 'calibration-gym', 'quantum_code'))
 
-repo_root = Path(__file__).resolve().parents[1]
-qc_path = str(repo_root / "calibration-gym" / "quantum_code")
-if qc_path not in __path__:
-    __path__.insert(0, qc_path)
+__all__ = [name for _, name, _ in pkgutil.iter_modules(__path__)]

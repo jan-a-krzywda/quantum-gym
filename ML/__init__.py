@@ -1,13 +1,11 @@
-"""Compatibility shim for top-level `ML` package.
+"""Top-level shim for backwards compatibility.
 
-This file makes `import ML` continue to work after the ML/ tree was moved into
-`calibration-gym/ML` by adding that path to this package's __path__.
+This package transparently re-exports the real implementation moved to
+`calibration-gym/ML` so existing import paths like `import ML` keep working.
 """
-from pathlib import Path
-import sys
+import importlib
+import pkgutil
+__path__.insert(0, importlib.import_module('os').path.join(importlib.import_module('os').path.dirname(__file__), '..', 'calibration-gym', 'ML'))
 
-# Insert the moved ML package location at the front of the package search path
-repo_root = Path(__file__).resolve().parents[1]
-ml_path = str(repo_root / "calibration-gym" / "ML")
-if ml_path not in __path__:
-    __path__.insert(0, ml_path)
+# Ensure package is importable; expose submodules normally.
+__all__ = [name for _, name, _ in pkgutil.iter_modules(__path__)]

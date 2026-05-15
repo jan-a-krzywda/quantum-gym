@@ -1,3 +1,76 @@
+# Top-level .gitignore for quantum-gym
+# Keep the repository clean by ignoring build artifacts, caches, notebooks checkpoints,
+# local environment directories, large data outputs, and model checkpoints.
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Jupyter Notebook checkpoints and outputs
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Jupyter kernel/metadata
+.ipynb_meta/
+
+# Visual Studio Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# macOS
+.DS_Store
+
+# Pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# Logs
+*.log
+logs/
+
+# Data and generated figures (keep small curated files under version control)
+data/
+figures/
+runs/**/data/
+runs/**/checkpoints/
+runs/**/figures/
+
+# Model weights / large artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npz_
+
+# Temporary files
+*.tmp
+*.swp
+
+# Quantum Inspire / cloud-backend credential helpers (if used locally)
+.qi_auth/
+
+# Misc
+*.cache
 # Local system files
 .DS_Store
 
@@ -15,3 +88,14 @@
 !docs/
 !docs/gifs/
 !docs/gifs/*.gif
+
+# latex auto-generated files
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.fls 
+*.gz 
+*latexmk

@@ -1,0 +1,35 @@
+\documentclass[twocolumn, 10pt, letterpaper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\geometry{margin=0.75in}
+\usepackage{hyperref}
+
+\title{\textbf{Scalable Autonomous Quantum Tomography: From Generative Active Inference to Hardware-Embedded Softmax}}
+\author{Jan A. Krzywda \\ \textit{Leiden Institute of Advanced Computer Science (LIACS), Leiden University} \\ \textit{QuTech and Kavli Institute of Nanoscience, TU Delft}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Characterizing multiqubit entanglement in semiconductor spin qubits is challenged by both statistical scaling and classical control latency. We present a comprehensive framework for autonomous active learning of quantum states. First, we demonstrate that an Active Inference controller achieves an order-of-magnitude sample efficiency gain over randomized classical shadows on a 5-qubit cluster state by systematically prioritizing high-weight commuting sub-observables. To overcome the exponential scaling of the Hilbert space, we extend this framework to a 17-qubit 2D lattice by introducing an autoregressive neural network as a generative world model. Finally, to eliminate the latency of shot-by-shot classical compilation, we introduce the ``Hardware Softmax''---a technique utilizing QND mid-circuit measurements and deferred \texttt{Crot} feed-forward to physically embed the agent's probability distribution natively into the processor architecture. 
+\end{abstract}
+
+\section{Introduction}
+State tomography requires measurement resources that scale exponentially. While classical shadows offer optimal worst-case bounds through uniform randomization, they ignore the inherent structural sparsity of resource states like cluster states and GHZ states. We frame tomography as a minimization of Expected Free Energy, balancing epistemic exploration with targeted exploitation of multi-qubit correlations.
+
+\section{Act I: The Algorithmic Advantage (5 Qubits)}
+To establish a rigorous statistical benchmark, we isolate a 5-qubit native zig-zag chain ($Q2-Q4-Q8-Q12-Q14$). By tracking exact Bayesian beliefs over the Pauli subspace, the Active Inference agent efficiently isolates the weight-3 stabilizers. We demonstrate that this active targeting reaches a $90\%$ fidelity threshold with $10\times$ fewer shots than standard uniform shadows, validating the ``Free Lunch'' mechanism of commuting sub-observable updates.
+
+\section{Act II: Generative Scaling (17 Qubits)}
+Scaling active learning to a 17-qubit 2D cluster state involves navigating $3^{17}$ potential measurement bases, rendering explicit tracking intractable. We transition the agent's world model to a lightweight autoregressive neural network. Trained via supervised learning on incoming shadow batches, the network learns the 2D lattice structure. Expected Free Energy is approximated by sampling the model's epistemic uncertainty, allowing the agent to dynamically map noise hotspots and broken $CZ$ bonds across the full surface code topography.
+
+\section{Act III: The Hardware Softmax Synthesis}
+While algorithmic optimization reduces shot counts, shot-by-shot classical compilation introduces prohibitive latency limits. We propose synthesizing our Active Inference protocol with \textit{in-situ} device physics. By initializing dedicated ancilla qubits using rotation angles mapped to the AI's Softmax distribution, the hardware autonomously ``samples'' the optimal measurement bases. Utilizing mid-circuit QND readouts and localized routing SWAPs on the measured ancillas, we execute deferred basis selection via quantum-controlled rotations (\texttt{Crot}), fully embedding active exploration into the hardware layer.
+
+\section{Conclusion}
+By transitioning from exact Bayesian tracking to generative neural modeling, and finally translating algorithmic uncertainty into physical hardware states, this framework offers a unified path to autonomous, low-latency characterization of large-scale quantum processors.
+
+\end{document}

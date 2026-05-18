@@ -61,10 +61,6 @@ The reconstructed density matrix qualitatively matches the ideal state at all sh
 The 3-qubit cluster state has three stabilisers $K_1 = XZI$, $K_2 = ZXZ$, $K_3 = IZX$ with ideal expectation value $+1$.  
 The observable $XXX$ (expected value $0$) serves as a null check.
 
-### Stabilizer fidelity convergence
-
-![Stabilizer fidelity](notebooks/data/shadow_act1_fidelity.png)
-
 > **Note:** all plot files are produced the first time `shadow_tomography_full.ipynb` is executed end-to-end.
 
 ## Structure

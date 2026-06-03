@@ -1,0 +1,6 @@
+torch
+qiskit
+qiskit-aer
+qiskit-quantuminspire
+numpy
+matplotlib

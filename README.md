@@ -1,48 +1,36 @@
-# quantum-gym
+# StoQastiQ
 
-A monorepo of quantum ML experiments grouped into three self-contained **gyms**.  
-Each gym targets a different stage of the quantum control pipeline.
+A hybrid Quantum-Classical model to simulate and decode a 2D Ornstein-Uhlenbeck (O-U) stochastic process.
 
----
+## Architecture
 
-## Gyms
+1. **Classical Data Generation** (`data.py`):
+   Simulates a 2D O-U process using the Euler-Maruyama method. The output is a time-series tensor of shape `(batch_size, sequence_length, 2)`. The generated trajectory has cross-correlation between the two dimensions.
 
-### `calibration-gym/`
-Builds a **digital twin** of a noisy quantum device using a Variational Autoencoder trained on raw readout data.  
-The latent space captures the low-dimensional structure of qubit/tau responses, enabling state monitoring, drift detection, and generation of synthetic calibration sequences.
+2. **Quantum Reservoir Encoder** (`quantum_reservoir.py`):
+   A 9-qubit quantum reservoir implemented with Qiskit. It acts as an encoder. Qubits are arranged in a 3x3 grid, and data is re-uploaded at each time step. Measured qubits collapse to a binary sequence, and are *not* reset between steps.
+   By default, the `use_hardware` parameter attempts to connect to the `Tuna-9` hardware via Quantum Inspire (`QIProvider`). If unauthenticated, it safely falls back to a Qiskit `AerSimulator`.
 
-Key components: VAE training (`ML/training/`), latent-dynamics analysis (`ML/analysis_processing/`), and device experiment notebooks (`quantum_code/`).
+3. **Classical Decoder** (`decoder.py`):
+   A PyTorch-based sequence decoder consisting of:
+   - An RC Embedding linear layer to project the binary quantum output to a continuous latent space.
+   - An LSTM layer.
+   - A linear Readout layer to reconstruct the 2D O-U process.
 
----
+4. **Training and Losses** (`train.py`):
+   Trains the classical decoder to reconstruct the O-U process from the quantum reservoir's "zebra plot" output. The loss is a combination of:
+   - MSE Trajectory Loss (`nn.MSELoss`)
+   - Custom 1D Autocorrelation (ACF) MSE Loss
 
-### `preparation-gym/`
-Proof-of-concept **RL + world-model** pipeline for adaptive state preparation.  
-A VAE-based world model is trained on circuit outcomes; a learned planner (beam search / active inference) proposes the next circuit to reduce preparation error.
+5. **Visualization** (`plot.py`):
+   Plots the generated O-U process, the 6-bit "zebra plot" output from the quantum reservoir, and the reconstructed trajectory compared to the target.
 
-Key components: world-model training, RL agent, beam search planner, and fingerprint utilities (`RL-world-model/`).
+## Running the project
 
----
+```bash
+# 1. Generate data, run the reservoir, train the decoder, and save sample data
+python train.py
 
-### `shadow_gym/`
-**Hardware-softmax shadow tomography** on Quantum Inspire (Tuna-17).  
-Embeds the random-basis selection directly into the quantum circuit via ancilla mid-circuit measurements, eliminating the classical-quantum round-trip bottleneck.  
-Includes simulation validation, density-matrix reconstruction via classical shadows, bootstrap convergence analysis, and an EFE-based active inference loop for adaptive basis selection.
-
-Key components: quantum environment + shadow processor (`src/`), merged simulation + hardware notebook (`notebooks/shadow_tomography_full.ipynb`).
-
----
-
-## Repository layout
-
-```
-quantum-gym/
-├── calibration-gym/
-│   ├── ML/                  # VAE, latent dynamics, plotting
-│   └── quantum_code/        # Device notebooks and experiment helpers
-├── preparation-gym/
-│   └── RL-world-model/      # World model, RL agent, beam search
-├── shadow_gym/
-│   ├── src/                 # QuantumEnvironment, ShadowProcessor, utils
-│   └── notebooks/           # shadow_tomography_full.ipynb
-└── docs/                    # Repository-level documentation
+# 2. Visualize the results
+python plot.py
 ```
